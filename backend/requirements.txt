@@ -1,0 +1,9 @@
+Flask
+Flask-Cors
+etcd3
+Flask-JWT-Extended
+Werkzeug
+python-dotenv
+sqlalchemy>=2.0
+sqlalchemy-libsql
+uvicorn

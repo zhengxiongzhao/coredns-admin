@@ -1,0 +1,203 @@
+name: Tauri Multi-Platform Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Create a GitHub Release'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  SIDECAR_NAME: coredns-admin-backend
+
+jobs:
+  build:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-22.04
+            rust_target: x86_64-unknown-linux-gnu
+            python_os: linux
+            ext: ''
+          - platform: macos-latest
+            rust_target: aarch64-apple-darwin
+            python_os: macos
+            ext: ''
+          - platform: macos-15-intel
+            rust_target: x86_64-apple-darwin
+            python_os: macos
+            ext: ''
+          - platform: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            python_os: windows
+            ext: '.exe'
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ========== System Dependencies ==========
+      - name: Install Linux dependencies
+        if: matrix.python_os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libgtk-3-dev \
+            libssl-dev
+
+      # ========== Python Setup & Backend Build ==========
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          pip install pyinstaller
+
+      - name: Build backend sidecar
+        run: |
+          python scripts/build-backend.py
+
+      - name: Verify sidecar binary
+        shell: bash
+        run: |
+          ls -la frontend/src-tauri/binaries/
+          FILE="frontend/src-tauri/binaries/${{ env.SIDECAR_NAME }}-${{ matrix.rust_target }}${{ matrix.ext }}"
+          if [ ! -f "$FILE" ]; then
+            echo "ERROR: Sidecar binary not found: $FILE"
+            exit 1
+          fi
+          echo "Sidecar binary size: $(du -h "$FILE" | cut -f1)"
+
+      # ========== Node.js Setup & Frontend Build ==========
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      # ========== Rust Setup ==========
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: frontend/src-tauri -> target
+
+      # ========== Sync Version from Tag ==========
+      - name: Sync version from git tag
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_name }}" =~ ^v(.+)$ ]]; then
+            VERSION="${BASH_REMATCH[1]}"
+          else
+            VERSION="0.0.0-dev"
+          fi
+          echo "Setting version to: $VERSION"
+          # Update tauri.conf.json
+          cd frontend/src-tauri
+          sed -i.bak "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" tauri.conf.json
+          rm -f tauri.conf.json.bak
+          cat tauri.conf.json | grep version
+          # Update Cargo.toml
+          sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+          rm -f Cargo.toml.bak
+
+      # ========== Tauri Build ==========
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: frontend
+          tauriScript: npx tauri
+          tagName: ${{ github.ref_name }}
+          releaseName: "CoreDNS Admin ${{ github.ref_name }}"
+          args: --target ${{ matrix.rust_target }}
+
+      # ========== Upload Artifacts ==========
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tauri-${{ matrix.rust_target }}
+          path: |
+            frontend/src-tauri/target/${{ matrix.rust_target }}/release/bundle/**/*.dmg
+            frontend/src-tauri/target/${{ matrix.rust_target }}/release/bundle/**/*.app
+            frontend/src-tauri/target/${{ matrix.rust_target }}/release/bundle/**/*.deb
+            frontend/src-tauri/target/${{ matrix.rust_target }}/release/bundle/**/*.AppImage
+            frontend/src-tauri/target/${{ matrix.rust_target }}/release/bundle/**/*.msi
+            frontend/src-tauri/target/${{ matrix.rust_target }}/release/bundle/**/*.exe
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ========== Release Job ==========
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.release == 'true')
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display artifacts
+        run: find artifacts -type f | head -50
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || 'manual-release' }}
+          name: "CoreDNS Admin ${{ github.ref_name || 'Dev Build' }}"
+          body: |
+            ## CoreDNS Admin Desktop Application
+
+            ### Downloads
+            - **macOS (Apple Silicon)**: `.dmg` file for M1/M2/M.. Macs
+            - **macOS (Intel)**: `.dmg` file for Intel Macs
+            - **Windows**: `.msi` installer
+            - **Linux**: `.deb` package or `.AppImage`
+
+            ### Requirements
+            - The application needs network access to connect to your Etcd cluster
+            - Configure your Etcd connection on first launch
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
+          files: |
+            artifacts/**/*.dmg
+            artifacts/**/*.msi
+            artifacts/**/*.exe
+            artifacts/**/*.deb
+            artifacts/**/*.AppImage
+          fail_on_unmatched_files: false

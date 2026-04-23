@@ -1,0 +1,9 @@
+*.pyc
+*.db
+test_*.py
+# docs/
+
+# PyInstaller build artifacts
+build/
+*.spec
+Test.md
